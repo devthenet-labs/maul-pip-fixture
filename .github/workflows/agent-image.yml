@@ -1,0 +1,93 @@
+# Builds the patchy agent image (.patchy/Dockerfile) and pushes it to ECR,
+# keylessly: GitHub's OIDC token is exchanged for this repository's own push
+# role, which trusts only this repository on refs/heads/main and can push only
+# to this repository's ECR repository. No stored secrets.
+#
+# Tags are immutable in ECR, so each build pushes only :sha-<short sha> and
+# never a moving tag. Point .patchy/agent.yaml at the new tag to adopt a build.
+name: agent-image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .patchy/**
+      # The declaration and its docs are not image inputs.
+      - "!.patchy/agent.yaml"
+      - "!.patchy/README.md"
+      - requirements.txt
+      - requirements-dev.txt
+      - .github/workflows/agent-image.yml
+  workflow_dispatch:
+
+# Nothing at the workflow level; the one job asks for what it needs.
+permissions: {}
+
+concurrency:
+  group: agent-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: patchy/app-envs/patchy-pip-fixture
+  PUSH_ROLE: arn:aws:iam::377946145366:role/devthenet-labs-app-env-push-patchy-pip-fixture
+  # The AWS KMS key the image is signed with (terraform-devthenet
+  # patchy-agent-signing.tf). patchy admits only images signed by it.
+  SIGNING_KEY: awskms:///alias/patchy-agent-image-signing
+
+jobs:
+  build-push:
+    name: Build and push agent image
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # mint the OIDC token exchanged for the ECR push role
+      contents: read # check out the repository
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compute tag
+        id: meta
+        run: |
+          echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.PUSH_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: .patchy/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.tag }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.created }}
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      # Sign exactly the digest just pushed: cosign's legacy sha256-<hex>.sig
+      # tag (a tag survives ECR's expire-untagged lifecycle rule), and nothing
+      # uploaded to the public transparency log.
+      - name: Sign the pushed digest
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}@${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --key "$SIGNING_KEY" --tlog-upload=false --new-bundle-format=false \
+            --use-signing-config=false --yes "$IMAGE"
+          cosign verify --key "$SIGNING_KEY" --insecure-ignore-tlog=true "$IMAGE" > /dev/null
