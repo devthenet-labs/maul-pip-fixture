@@ -1,4 +1,4 @@
-"""A tiny package for patchy's egress-proxy tunnel gate (pip through a CONNECT tunnel)."""
+"""A tiny package for maul's egress-proxy tunnel gate (pip through a CONNECT tunnel)."""
 
 import requests
 from slugify import slugify
